@@ -8,7 +8,38 @@ let cache = null;
 let cacheKey = "";
 let selected = new Set();
 let buyer = { name: "", email: "", phone: "" };
-let draft = { title: "", prize: "", description: "", price: "2000", total: "100", organizer: "", phone: "" };
+let draft = {
+  title: "",
+  prize: "",
+  description: "",
+  price: "2000",
+  total: "100",
+  organizer: "",
+  phone: "",
+  bank: "BancoEstado",
+  bankOther: "",
+  accountType: "Cuenta RUT",
+  accountNumber: "",
+  rut: "",
+  holder: "",
+};
+
+const BANKS = [
+  "BancoEstado",
+  "Banco de Chile",
+  "Banco Santander",
+  "BCI",
+  "Scotiabank",
+  "Itaú",
+  "Banco BICE",
+  "Banco Security",
+  "Banco Falabella",
+  "Banco Ripley",
+  "Tenpo",
+  "Otro",
+];
+
+const ACCOUNT_TYPES = ["Cuenta RUT", "Cuenta vista", "Cuenta corriente", "Cuenta de ahorro"];
 let busy = false;
 let errorMsg = "";
 let renderGen = 0;
@@ -56,6 +87,53 @@ function showPhone(value) {
     return `+${phone.slice(0, 2)} ${phone.slice(2, 3)} ${phone.slice(3, 7)} ${phone.slice(7)}`;
   }
   return phone || "sin teléfono";
+}
+
+function cleanRut(value) {
+  return String(value ?? "").replace(/\./g, "").replace(/-/g, "").toUpperCase();
+}
+
+function validRut(value) {
+  const rut = cleanRut(value);
+  if (!/^\d{7,8}[0-9K]$/.test(rut)) return false;
+  const body = rut.slice(0, -1);
+  const dv = rut.slice(-1);
+  let sum = 0;
+  let mul = 2;
+  for (let i = body.length - 1; i >= 0; i -= 1) {
+    sum += Number(body[i]) * mul;
+    mul = mul === 7 ? 2 : mul + 1;
+  }
+  const rest = 11 - (sum % 11);
+  const expected = rest === 11 ? "0" : rest === 10 ? "K" : String(rest);
+  return dv === expected;
+}
+
+function formatRut(value) {
+  const rut = cleanRut(value);
+  const body = rut.slice(0, -1);
+  const dv = rut.slice(-1);
+  return `${body.replace(/\B(?=(\d{3})+(?!\d))/g, ".")}-${dv}`;
+}
+
+function rpcMessage(error, fallback) {
+  const text = error?.message || "";
+  const known = {
+    number_taken: "Alguien acaba de tomar uno de esos números. Elige otros.",
+    raffle_closed: "Esta rifa ya no está vendiendo números.",
+    invalid_email: "El correo no es válido.",
+    invalid_name: "Escribe tu nombre completo.",
+    invalid_numbers: "Elige entre 1 y 15 números.",
+    invalid_rut: "El RUT de la cuenta no es válido.",
+    invalid_bank: "Revisa el banco, el tipo de cuenta y el número.",
+    invalid_raffle: "Revisa los datos. El precio va entre $1.000 y $200.000.",
+    missing_account: "Esta rifa no tiene una cuenta para transferir.",
+    expired: "Esa reserva ya venció.",
+    already_paid: "Ese pago ya estaba confirmado.",
+    cannot_confirm: "Esa reserva ya no se puede confirmar.",
+  };
+  const code = Object.keys(known).find((key) => text.includes(key));
+  return new Error(code ? known[code] : fallback);
 }
 
 function pageBase() {
@@ -151,6 +229,11 @@ function demoLoad() {
         total_numbers: 50,
         organizer_name: "Ana Pérez",
         organizer_phone: "56912345678",
+        bank_name: "BancoEstado",
+        account_type: "Cuenta RUT",
+        account_number: "12345678",
+        account_rut: "12.345.678-5",
+        account_holder: "Ana Pérez",
         admin_token: "demo-clave",
         status: "open",
         winner_number: null,
@@ -167,7 +250,8 @@ function demoLoad() {
         buyer_phone: "56911111111",
         amount_clp: 2000,
         status: "paid",
-        reserved_until: new Date().toISOString(),
+        transfer_code: "PAGADO",
+        reserved_until: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
         paid_at: new Date().toISOString(),
         numbers: [7],
       },
@@ -181,11 +265,24 @@ function demoSave(db) {
   localStorage.setItem(DEMO_KEY, JSON.stringify(db));
 }
 
+function activeOrders(db, raffleId) {
+  const now = Date.now();
+  return db.orders.filter((order) => {
+    if (order.raffle_id !== raffleId) return false;
+    if (order.status === "paid") return true;
+    if (order.status !== "pending" && order.status !== "reported") return false;
+    return new Date(order.reserved_until).getTime() > now;
+  });
+}
+
 function purgeExpired(db, raffleId) {
   const now = Date.now();
-  db.orders = db.orders.filter((order) => {
-    if (order.raffle_id !== raffleId || order.status !== "pending") return true;
-    return new Date(order.reserved_until).getTime() > now;
+  db.orders.forEach((order) => {
+    if (order.raffle_id !== raffleId) return;
+    if (order.status !== "pending" && order.status !== "reported") return;
+    if (new Date(order.reserved_until).getTime() > now) return;
+    order.status = "failed";
+    order.numbers = [];
   });
 }
 
@@ -196,15 +293,27 @@ const demoApi = {
     demoSave(db);
     const raffle = db.raffles.find((item) => item.id === id);
     if (!raffle) throw new Error("No encontramos esta rifa. Revisa el enlace.");
-    const tickets = db.orders
-      .filter((order) => order.raffle_id === id && (order.status === "paid" || order.status === "pending"))
+    if (!raffle.account_number) {
+      raffle.bank_name = "BancoEstado";
+      raffle.account_type = "Cuenta RUT";
+      raffle.account_number = "12345678";
+      raffle.account_rut = "12.345.678-5";
+      raffle.account_holder = raffle.organizer_name;
+    }
+    const tickets = activeOrders(db, id)
       .flatMap((order) => order.numbers.map((number) => ({ number, status: order.status === "paid" ? "paid" : "reserved" })));
     return { raffle, tickets };
   },
   async orderStatus(orderId) {
     const order = demoLoad().orders.find((item) => item.id === orderId);
     if (!order) return null;
-    return { status: order.status, raffle_id: order.raffle_id, numbers: order.numbers };
+    return {
+      status: order.status,
+      raffle_id: order.raffle_id,
+      numbers: order.numbers,
+      amount_clp: order.amount_clp,
+      transfer_code: order.transfer_code,
+    };
   },
   async createRaffle(input) {
     const db = demoLoad();
@@ -227,35 +336,33 @@ const demoApi = {
     purgeExpired(db, input.raffleId);
     const raffle = db.raffles.find((item) => item.id === input.raffleId);
     if (!raffle || raffle.status !== "open") throw new Error("Esta rifa ya no está vendiendo números.");
-    const taken = new Set(
-      db.orders
-        .filter((order) => order.raffle_id === input.raffleId)
-        .flatMap((order) => order.numbers),
-    );
+    const taken = new Set(activeOrders(db, input.raffleId).flatMap((order) => order.numbers));
     if (input.numbers.some((number) => taken.has(number))) {
       throw new Error("Alguien acaba de tomar uno de esos números. Elige otros.");
     }
+    const orderId = crypto.randomUUID();
     const order = {
-      id: crypto.randomUUID(),
+      id: orderId,
       raffle_id: input.raffleId,
       buyer_name: input.buyerName.trim(),
       buyer_email: input.buyerEmail.trim().toLowerCase(),
-      buyer_phone: digits(input.buyerPhone),
+      buyer_phone: chilePhone(input.buyerPhone),
       amount_clp: raffle.price_clp * input.numbers.length,
-      status: "paid",
-      reserved_until: new Date().toISOString(),
-      paid_at: new Date().toISOString(),
+      status: "reported",
+      transfer_code: orderId.replaceAll("-", "").slice(0, 6).toUpperCase(),
+      reserved_until: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
+      paid_at: null,
       numbers: input.numbers,
     };
     db.orders.unshift(order);
     demoSave(db);
-    return { demoPaid: true, orderId: order.id };
+    return { orderId: order.id, transferCode: order.transfer_code };
   },
   async getAdmin(id, token) {
     const db = demoLoad();
     const raffle = db.raffles.find((item) => item.id === id && item.admin_token === token);
     if (!raffle) throw new Error("Este enlace de organización no es válido.");
-    const orders = db.orders.filter((order) => order.raffle_id === id && order.status === "paid");
+    const orders = activeOrders(db, id);
     return { raffle, orders };
   },
   async setStatus(id, token, status) {
@@ -281,6 +388,27 @@ const demoApi = {
     raffle.drawn_at = new Date().toISOString();
     demoSave(db);
     return { winner_number: raffle.winner_number };
+  },
+  async confirmOrder(raffleId, token, orderId) {
+    const db = demoLoad();
+    const raffle = db.raffles.find((item) => item.id === raffleId && item.admin_token === token);
+    const order = db.orders.find((item) => item.id === orderId && item.raffle_id === raffleId);
+    if (!raffle || !order || order.status === "failed") throw new Error("Esa reserva ya no se puede confirmar.");
+    if (order.status !== "paid") {
+      order.status = "paid";
+      order.paid_at = new Date().toISOString();
+      demoSave(db);
+    }
+  },
+  async rejectOrder(raffleId, token, orderId) {
+    const db = demoLoad();
+    const raffle = db.raffles.find((item) => item.id === raffleId && item.admin_token === token);
+    const order = db.orders.find((item) => item.id === orderId && item.raffle_id === raffleId);
+    if (!raffle || !order) throw new Error("No encontramos esa reserva.");
+    if (order.status === "paid") throw new Error("Ese pago ya estaba confirmado.");
+    order.status = "failed";
+    order.numbers = [];
+    demoSave(db);
   },
 };
 
@@ -317,25 +445,26 @@ const liveApi = {
       p_total: input.total_numbers,
       p_organizer_name: input.organizer_name,
       p_organizer_phone: input.organizer_phone,
+      p_bank_name: input.bank_name,
+      p_account_type: input.account_type,
+      p_account_number: input.account_number,
+      p_account_rut: input.account_rut,
+      p_account_holder: input.account_holder,
     });
-    if (error || !data) throw new Error("Revisa los datos. El precio va entre $1.000 y $200.000, y los números entre 10 y 300.");
+    if (error || !data) throw rpcMessage(error, "No se pudo publicar la rifa. Revisa los datos de la cuenta.");
     return data;
   },
   async checkout(input) {
-    const response = await fetch(`${cfg.supabaseUrl}/functions/v1/create-checkout`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        apikey: cfg.supabaseAnonKey,
-        Authorization: `Bearer ${cfg.supabaseAnonKey}`,
-      },
-      body: JSON.stringify(input),
+    const sb = await this.client();
+    const { data, error } = await sb.rpc("reserve_numbers", {
+      p_raffle_id: input.raffleId,
+      p_numbers: input.numbers,
+      p_name: input.buyerName,
+      p_email: input.buyerEmail,
+      p_phone: input.buyerPhone,
     });
-    const body = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(body.message || "No se pudo iniciar el pago.");
-    }
-    return body;
+    if (error || !data) throw rpcMessage(error, "No se pudieron reservar los números.");
+    return { orderId: data.order_id, transferCode: data.transfer_code };
   },
   async getAdmin(id, token) {
     const sb = await this.client();
@@ -364,6 +493,24 @@ const liveApi = {
     if (error) throw new Error("No se pudo sortear. Confirma que haya números pagados y que la rifa no tenga ganador.");
     return data;
   },
+  async confirmOrder(raffleId, token, orderId) {
+    const sb = await this.client();
+    const { error } = await sb.rpc("confirm_transfer", {
+      p_raffle_id: raffleId,
+      p_token: token,
+      p_order_id: orderId,
+    });
+    if (error) throw rpcMessage(error, "No se pudo confirmar el pago.");
+  },
+  async rejectOrder(raffleId, token, orderId) {
+    const sb = await this.client();
+    const { error } = await sb.rpc("reject_transfer", {
+      p_raffle_id: raffleId,
+      p_token: token,
+      p_order_id: orderId,
+    });
+    if (error) throw rpcMessage(error, "No se pudo liberar el número.");
+  },
 };
 
 const api = live ? liveApi : demoApi;
@@ -391,7 +538,7 @@ function homeView(data) {
   return `<section class="hero">
       <div>
         <h1>La rifa se comparte por enlace, no en una hoja.</h1>
-        <p class="lead">Armas el premio, publicas los números y la gente en cualquier parte de Chile elige el suyo y paga en línea. Tú ves al tiro quién compró cada número.</p>
+        <p class="lead">Armas el premio, publicas los números y la gente en cualquier parte de Chile elige el suyo. La transferencia llega a la cuenta de quien creó la rifa.</p>
         <div class="acciones">
           <a class="btn btn-primario" href="./?nueva=1" data-go="create">Armar una rifa</a>
           ${sample}
@@ -405,9 +552,9 @@ function homeView(data) {
       </article>
     </section>
     <section class="pasos">
-      <article class="tarjeta"><strong>1. Publicas</strong><p class="muted">Premio, precio y cuántos números. Guardas el enlace de organización.</p></article>
-      <article class="tarjeta"><strong>2. Eligen y pagan</strong><p class="muted">Cada persona marca sus números. Mercado Pago cobra y el número queda tomado.</p></article>
-      <article class="tarjeta"><strong>3. Sorteas</strong><p class="muted">Cuando cierres las ventas, el sitio elige al azar entre los números pagados.</p></article>
+      <article class="tarjeta"><strong>1. Publicas</strong><p class="muted">Premio, precio y la cuenta donde quieres recibir la transferencia.</p></article>
+      <article class="tarjeta"><strong>2. Eligen y transfieren</strong><p class="muted">Cada persona marca sus números y transfiere con un código para que puedas reconocer el pago.</p></article>
+      <article class="tarjeta"><strong>3. Confirmas y sorteas</strong><p class="muted">Cuando veas la plata en tu cuenta, marcas el número como pagado y después sorteas.</p></article>
     </section>
     ${mine}`;
 }
@@ -437,28 +584,56 @@ function createView() {
         <input id="org" name="organizer" required minlength="3" maxlength="80" value="${esc(draft.organizer)}" />
         <label for="fono">WhatsApp de contacto</label>
         <input id="fono" name="phone" required inputmode="tel" placeholder="+56 9 1234 5678" value="${esc(draft.phone)}" />
-        <p class="ayuda">Sale en la rifa para que te escriban. El pago lo recibe la cuenta de Mercado Pago de este sitio${cfg.collectorName ? `, a nombre de ${esc(cfg.collectorName)}` : ""}.</p>
+        <p class="ayuda">Sale en la rifa para que te escriban si tienen dudas.</p>
+        <h2>Cuenta para la transferencia</h2>
+        <label for="banco">Banco</label>
+        <select id="banco" name="bank">
+          ${BANKS.map((bank) => `<option value="${esc(bank)}" ${draft.bank === bank ? "selected" : ""}>${esc(bank)}</option>`).join("")}
+        </select>
+        <label for="otro-banco">Nombre del banco</label>
+        <input id="otro-banco" name="bankOther" maxlength="40" placeholder="Solo si elegiste Otro" value="${esc(draft.bankOther)}" />
+        <label for="tipo">Tipo de cuenta</label>
+        <select id="tipo" name="accountType">
+          ${ACCOUNT_TYPES.map((type) => `<option value="${esc(type)}" ${draft.accountType === type ? "selected" : ""}>${esc(type)}</option>`).join("")}
+        </select>
+        <label for="cuenta">Número de cuenta</label>
+        <input id="cuenta" name="accountNumber" required inputmode="numeric" minlength="4" maxlength="20" value="${esc(draft.accountNumber)}" />
+        <label for="rut">RUT del titular</label>
+        <input id="rut" name="rut" required placeholder="12.345.678-5" value="${esc(draft.rut)}" />
+        <label for="titular">Nombre del titular</label>
+        <input id="titular" name="holder" required minlength="3" maxlength="80" value="${esc(draft.holder)}" />
+        <p class="ayuda">Estos datos se muestran a quien compra, para que te transfiera directo.</p>
         <p class="honeypot" aria-hidden="true"><label>Empresa<input name="company" tabindex="-1" autocomplete="off" /></label></p>
         <button class="primario" type="submit" ${busy ? "disabled" : ""}>${busy ? "Creando…" : "Publicar rifa"}</button>
       </form>
     </section>`;
 }
 
-function paymentBanner(r, order) {
-  if (r.pago === "error") {
-    return `<p class="alerta">El pago no se completó. Si no te cobraron, puedes elegir los números otra vez.</p>`;
+function transferInstructions(raffle, order) {
+  if (!order) return "";
+  const nums = (order.numbers || []).map((number) => pad(number, raffle.total_numbers)).join(", ");
+  if (order.status === "paid") {
+    return `<p class="ok">El organizador confirmó tu transferencia. Tus números: ${esc(nums)}.</p>`;
   }
-  if (r.pago === "pendiente") {
-    return `<p class="espera">Mercado Pago dejó el pago pendiente. Si se aprueba, los números se marcan solos.</p>`;
+  if (order.status === "failed") {
+    return `<p class="alerta">El organizador liberó estos números. Si ya transferiste, escríbele por WhatsApp.</p>`;
   }
-  if (r.pago === "ok" || r.orden) {
-    if (order?.status === "paid") {
-      const nums = (order.numbers || []).map((n) => pad(n, cache.raffle.total_numbers)).join(", ");
-      return `<p class="ok">Pago confirmado. Tus números: ${esc(nums)}.</p>`;
-    }
-    if (r.pago === "ok") return `<p class="espera">Estamos confirmando tu pago con Mercado Pago…</p>`;
-  }
-  return "";
+  if (order.status !== "reported" && order.status !== "pending") return "";
+  return `<section class="panel bloque">
+      <h2>Transfiere ${money(order.amount_clp)}</h2>
+      <p>Números reservados por 48 horas: ${esc(nums)}. En el comentario de la transferencia escribe este código:</p>
+      <p class="codigo">${esc(order.transfer_code || "")}</p>
+      <button type="button" class="claro" data-copy="${esc(order.transfer_code || "")}">Copiar código</button>
+      <div class="cuenta">
+        <div><span>Banco</span><strong>${esc(raffle.bank_name)}</strong></div>
+        <div><span>Tipo</span><strong>${esc(raffle.account_type)}</strong></div>
+        <div><span>Cuenta</span><strong>${esc(raffle.account_number)}</strong></div>
+        <div><span>RUT</span><strong>${esc(raffle.account_rut)}</strong></div>
+        <div><span>Titular</span><strong>${esc(raffle.account_holder)}</strong></div>
+      </div>
+      <button type="button" class="claro" data-copy="${esc(raffle.account_number)}">Copiar número de cuenta</button>
+      <p class="ayuda">El número pasa a pagado cuando el organizador ve la transferencia en su cuenta.</p>
+    </section>`;
 }
 
 function raffleView(r, data) {
@@ -481,18 +656,21 @@ function raffleView(r, data) {
     ? `<section class="ganador"><p>Número ganador</p><strong>${pad(raffle.winner_number, raffle.total_numbers)}</strong><p>Sorteado entre los números que alcanzaron a pagarse.</p></section>`
     : "";
   const totalSel = selected.size * raffle.price_clp;
-  const form = open && selected.size
+  const form = !raffle.account_number
+    ? `<p class="alerta bloque">Esta rifa todavía no tiene una cuenta para transferir.</p>`
+    : open && selected.size
     ? `<form id="form-pago" class="panel bloque">
         <h2>Tus datos</h2>
         ${errorMsg ? `<p class="alerta">${esc(errorMsg)}</p>` : ""}
+        <p>Vas a transferir <strong>${money(totalSel)}</strong> a ${esc(raffle.account_holder)}, ${esc(raffle.bank_name)}.</p>
         <label for="nombre">Nombre</label>
         <input id="nombre" name="name" required minlength="3" maxlength="80" autocomplete="name" value="${esc(buyer.name)}" />
         <label for="correo">Correo</label>
         <input id="correo" name="email" type="email" required maxlength="120" autocomplete="email" value="${esc(buyer.email)}" />
         <label for="comprador">WhatsApp</label>
         <input id="comprador" name="phone" required inputmode="tel" autocomplete="tel" value="${esc(buyer.phone)}" />
-        <button class="primario" type="submit" ${busy ? "disabled" : ""}>${busy ? "Abriendo pago…" : live ? `Pagar ${money(totalSel)} con Mercado Pago` : `Simular pago de ${money(totalSel)}`}</button>
-        <p class="ayuda">${live ? "El número queda reservado 20 minutos mientras pagas." : "Modo demostración: no se cobra dinero real."}</p>
+        <button class="primario" type="submit" ${busy ? "disabled" : ""}>${busy ? "Reservando…" : "Reservar y ver datos para transferir"}</button>
+        <p class="ayuda">Los números quedan tomados 48 horas. El organizador los marca pagados cuando ve la transferencia.</p>
       </form>`
     : "";
   return `${winner}
@@ -504,7 +682,7 @@ function raffleView(r, data) {
       </div>
       <p class="precio">${money(raffle.price_clp)} <span class="muted">c/u</span></p>
     </section>
-    ${paymentBanner(r, data.order)}
+    ${transferInstructions(raffle, data.order)}
     ${raffle.description ? `<p>${esc(raffle.description)}</p>` : ""}
     <p class="muted">Organiza ${esc(raffle.organizer_name)}. <a href="${esc(wa)}" target="_blank" rel="noopener">Escribir por WhatsApp</a></p>
     <div class="acciones">
@@ -515,7 +693,7 @@ function raffleView(r, data) {
       <div class="resumen"><strong>${paidCount} de ${raffle.total_numbers} pagados</strong><span>${pct}%</span></div>
       <div class="barra" aria-hidden="true"><span style="width:${pct}%"></span></div>
       <div class="numeros">${numbers}</div>
-      <p class="leyenda"><span><i class="punto libre"></i>Libre</span><span><i class="punto elegido"></i>Tu selección</span><span><i class="punto reservado"></i>En pago</span><span><i class="punto pagado"></i>Pagado</span></p>
+      <p class="leyenda"><span><i class="punto libre"></i>Libre</span><span><i class="punto elegido"></i>Tu selección</span><span><i class="punto reservado"></i>Por confirmar</span><span><i class="punto pagado"></i>Pagado</span></p>
     </section>
     ${form}
     ${open && selected.size ? `<div class="paybar"><p><strong>${selected.size}</strong> ${selected.size === 1 ? "número" : "números"} · ${money(totalSel)}</p><a class="btn btn-primario" href="#form-pago">Continuar</a></div>` : ""}`;
@@ -525,14 +703,19 @@ function adminView(r, data) {
   const raffle = data.raffle;
   const orders = data.orders || [];
   const paid = orders.filter((order) => order.status === "paid");
-  const numbersPaid = paid.reduce((sum, order) => sum + order.numbers.length, 0);
+  const numbersPaid = paid.reduce((sum, order) => sum + (order.numbers || []).length, 0);
   const collected = paid.reduce((sum, order) => sum + Number(order.amount_clp), 0);
   const rows = orders
     .map((order) => {
-      const nums = order.numbers.map((number) => pad(number, raffle.total_numbers)).join(", ");
-      return `<article class="tarjeta compra">
-        <div><strong>${esc(nums)}</strong><p>${esc(order.buyer_name)} · ${esc(order.buyer_email)}</p><p class="muted">${esc(showPhone(order.buyer_phone))} · ${esc(order.status === "paid" ? "Pagado" : "Reservado")}</p></div>
-        <strong>${money(order.amount_clp)}</strong>
+      const nums = (order.numbers || []).map((number) => pad(number, raffle.total_numbers)).join(", ");
+      const waiting = order.status === "reported" || order.status === "pending";
+      const label = order.status === "paid" ? "Pagado" : "Por confirmar";
+      return `<article class="tarjeta">
+        <div class="compra">
+          <div><strong>${esc(nums)}</strong><p>${esc(order.buyer_name)} · ${esc(order.buyer_email)}</p><p class="muted">${esc(showPhone(order.buyer_phone))} · ${label}${order.transfer_code ? ` · código ${esc(order.transfer_code)}` : ""}</p></div>
+          <strong>${money(order.amount_clp)}</strong>
+        </div>
+        ${waiting ? `<div class="acciones"><button type="button" class="primario" data-confirm="${esc(order.id)}">Confirmar pago</button><button type="button" class="claro" data-reject="${esc(order.id)}">Liberar número</button></div>` : ""}
       </article>`;
     })
     .join("");
@@ -667,7 +850,7 @@ function readBuyer(form) {
 function downloadCsv(raffle, orders) {
   const lines = [["numero", "nombre", "correo", "telefono", "estado", "monto_clp"]];
   orders.forEach((order) => {
-    order.numbers.forEach((number) => {
+    (order.numbers || []).forEach((number) => {
       lines.push([
         number,
         order.buyer_name,
@@ -711,7 +894,7 @@ document.body.addEventListener("click", async (event) => {
     const value = Number(number.dataset.numero);
     if (selected.has(value)) selected.delete(value);
     else if (selected.size < 15) selected.add(value);
-    else aviso("Puedes llevar hasta 15 números por pago.");
+    else aviso("Puedes llevar hasta 15 números por reserva.");
     errorMsg = "";
     paint(false);
     return;
@@ -730,6 +913,28 @@ document.body.addEventListener("click", async (event) => {
       paint(false);
     } finally {
       busy = false;
+    }
+    return;
+  }
+
+  const orderAction = event.target.closest("[data-confirm], [data-reject]");
+  if (orderAction && cache?.raffle) {
+    const orderId = orderAction.dataset.confirm || orderAction.dataset.reject;
+    const confirming = Boolean(orderAction.dataset.confirm);
+    const ok = confirm(confirming
+      ? "¿Ya viste esta transferencia en tu cuenta?"
+      : "¿Liberar estos números para que otra persona pueda tomarlos?");
+    if (!ok) return;
+    const r = route();
+    try {
+      if (confirming) await api.confirmOrder(r.id, r.token, orderId);
+      else await api.rejectOrder(r.id, r.token, orderId);
+      cache = await load(r);
+      errorMsg = "";
+      paint(false);
+    } catch (error) {
+      errorMsg = error.message;
+      paint(false);
     }
     return;
   }
@@ -778,7 +983,29 @@ document.body.addEventListener("submit", async (event) => {
       total: form.total.value,
       organizer: form.organizer.value,
       phone: form.phone.value,
+      bank: form.bank.value,
+      bankOther: form.bankOther.value,
+      accountType: form.accountType.value,
+      accountNumber: form.accountNumber.value,
+      rut: form.rut.value,
+      holder: form.holder.value,
     };
+    const bankName = draft.bank === "Otro" ? draft.bankOther.trim() : draft.bank;
+    if (!validRut(draft.rut)) {
+      errorMsg = "El RUT de la cuenta no es válido.";
+      paint(false);
+      return;
+    }
+    if (digits(draft.accountNumber).length < 4) {
+      errorMsg = "Escribe el número de cuenta, solo dígitos.";
+      paint(false);
+      return;
+    }
+    if (bankName.length < 3) {
+      errorMsg = "Escribe el nombre del banco.";
+      paint(false);
+      return;
+    }
     const input = {
       title: draft.title.trim(),
       prize: draft.prize.trim(),
@@ -787,6 +1014,11 @@ document.body.addEventListener("submit", async (event) => {
       total_numbers: Number(draft.total),
       organizer_name: draft.organizer.trim(),
       organizer_phone: chilePhone(draft.phone),
+      bank_name: bankName,
+      account_type: draft.accountType,
+      account_number: digits(draft.accountNumber),
+      account_rut: formatRut(draft.rut),
+      account_holder: draft.holder.trim(),
     };
     if (input.organizer_phone.length < 8) {
       errorMsg = "Escribe un WhatsApp con código de país, por ejemplo +56 9 1234 5678.";
@@ -837,17 +1069,13 @@ document.body.addEventListener("submit", async (event) => {
         buyerEmail: draft.email.trim(),
         buyerPhone: chilePhone(draft.phone),
       });
-      if (result.initPoint) {
-        location.href = result.initPoint;
-        return;
-      }
       selected = new Set();
       buyer = { name: "", email: "", phone: "" };
       busy = false;
-      cache = await load({ ...r, orden: result.orderId, pago: "ok" });
-      history.replaceState({}, "", `${location.pathname}?rifa=${encodeURIComponent(r.id)}&orden=${encodeURIComponent(result.orderId)}&pago=ok`);
+      history.replaceState({}, "", `${location.pathname}?rifa=${encodeURIComponent(r.id)}&orden=${encodeURIComponent(result.orderId)}`);
+      cache = await load({ ...r, orden: result.orderId });
       paint(true);
-      aviso("Pago simulado. En el sitio real aquí se abre Mercado Pago.");
+      aviso("Números reservados. Transfiere usando el código que aparece arriba.");
     } catch (error) {
       busy = false;
       errorMsg = error.message;
@@ -866,10 +1094,7 @@ window.addEventListener("popstate", () => {
 const modo = document.querySelector("#modo");
 if (!live) {
   modo.hidden = false;
-  modo.textContent = "Modo demostración: puedes recorrer la rifa, pero los pagos no son reales hasta conectar Supabase y Mercado Pago.";
-} else if (cfg.collectorName) {
-  modo.hidden = false;
-  modo.textContent = `Los pagos entran a la cuenta de Mercado Pago de ${cfg.collectorName}.`;
+  modo.textContent = "Modo demostración: puedes recorrer la rifa. Las transferencias no son reales hasta conectar Supabase.";
 }
 
 render(true);
