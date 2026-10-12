@@ -22,7 +22,12 @@ let draft = {
   accountNumber: "",
   rut: "",
   holder: "",
+  prizeImage: "",
+  drawAt: "",
 };
+
+let onlyFree = false;
+let numberQuery = "";
 
 const BANKS = [
   "BancoEstado",
@@ -116,6 +121,48 @@ function formatRut(value) {
   return `${body.replace(/\B(?=(\d{3})+(?!\d))/g, ".")}-${dv}`;
 }
 
+function formatWhen(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat("es-CL", {
+    dateStyle: "full",
+    timeStyle: "short",
+  }).format(date);
+}
+
+function timeLeft(until) {
+  const ms = new Date(until).getTime() - Date.now();
+  if (!until || Number.isNaN(ms)) return "";
+  if (ms <= 0) return "La reserva ya venció";
+  const hours = Math.floor(ms / 3600000);
+  const minutes = Math.floor((ms % 3600000) / 60000);
+  if (hours >= 1) return `Quedan ${hours} h ${minutes} min para transferir`;
+  return `Quedan ${minutes} min para transferir`;
+}
+
+function compressImage(file) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    const url = URL.createObjectURL(file);
+    image.onload = () => {
+      const max = 900;
+      const scale = Math.min(1, max / Math.max(image.width, image.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(image.width * scale));
+      canvas.height = Math.max(1, Math.round(image.height * scale));
+      canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL("image/jpeg", 0.72));
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("No se pudo leer la foto."));
+    };
+    image.src = url;
+  });
+}
+
 function rpcMessage(error, fallback) {
   const text = error?.message || "";
   const known = {
@@ -127,6 +174,7 @@ function rpcMessage(error, fallback) {
     invalid_rut: "El RUT de la cuenta no es válido.",
     invalid_bank: "Revisa el banco, el tipo de cuenta y el número.",
     invalid_raffle: "Revisa los datos. El precio va entre $1.000 y $200.000.",
+    invalid_image: "La foto tiene que ser un enlace https o una imagen más liviana.",
     missing_account: "Esta rifa no tiene una cuenta para transferir.",
     expired: "Esa reserva ya venció.",
     already_paid: "Ese pago ya estaba confirmado.",
@@ -313,6 +361,7 @@ const demoApi = {
       numbers: order.numbers,
       amount_clp: order.amount_clp,
       transfer_code: order.transfer_code,
+      reserved_until: order.reserved_until,
     };
   },
   async createRaffle(input) {
@@ -437,7 +486,7 @@ const liveApi = {
   },
   async createRaffle(input) {
     const sb = await this.client();
-    const { data, error } = await sb.rpc("create_raffle", {
+    const payload = {
       p_title: input.title,
       p_prize: input.prize,
       p_description: input.description,
@@ -450,9 +499,17 @@ const liveApi = {
       p_account_number: input.account_number,
       p_account_rut: input.account_rut,
       p_account_holder: input.account_holder,
+    };
+    let result = await sb.rpc("create_raffle", {
+      ...payload,
+      p_prize_image: input.prize_image_url || "",
+      p_draw_at: input.draw_at,
     });
-    if (error || !data) throw rpcMessage(error, "No se pudo publicar la rifa. Revisa los datos de la cuenta.");
-    return data;
+    if (result.error && /create_raffle|schema cache|PGRST202/i.test(result.error.message || "")) {
+      result = await sb.rpc("create_raffle", payload);
+    }
+    if (result.error || !result.data) throw rpcMessage(result.error, "No se pudo publicar la rifa. Revisa los datos de la cuenta.");
+    return result.data;
   },
   async checkout(input) {
     const sb = await this.client();
@@ -569,6 +626,12 @@ function createView() {
         <input id="titulo" name="title" required minlength="3" maxlength="80" placeholder="Rifa curso 4º medio" value="${esc(draft.title)}" />
         <label for="premio">Premio</label>
         <input id="premio" name="prize" required minlength="3" maxlength="140" placeholder="Bicicleta o gift card" value="${esc(draft.prize)}" />
+        <label for="foto">Foto del premio</label>
+        <input id="foto" name="photo" type="file" accept="image/jpeg,image/png,image/webp" />
+        ${draft.prizeImage ? `<img class="premio-foto" alt="Vista previa del premio" src="${esc(draft.prizeImage)}" />` : ""}
+        <p class="ayuda">Opcional. Se muestra arriba de los números.</p>
+        <label for="sorteo">Fecha del sorteo</label>
+        <input id="sorteo" name="drawAt" type="datetime-local" value="${esc(draft.drawAt)}" />
         <label for="detalle">Detalle</label>
         <textarea id="detalle" name="description" maxlength="500" placeholder="Cómo se entrega el premio y cualquier condición.">${esc(draft.description)}</textarea>
         <label for="precio">Precio por número</label>
@@ -623,6 +686,7 @@ function transferInstructions(raffle, order) {
       <h2>Transfiere ${money(order.amount_clp)}</h2>
       <p>Números reservados por 48 horas: ${esc(nums)}. En el comentario de la transferencia escribe este código:</p>
       <p class="codigo">${esc(order.transfer_code || "")}</p>
+      <p class="espera">${esc(timeLeft(order.reserved_until))}</p>
       <button type="button" class="claro" data-copy="${esc(order.transfer_code || "")}">Copiar código</button>
       <div class="cuenta">
         <div><span>Banco</span><strong>${esc(raffle.bank_name)}</strong></div>
@@ -636,26 +700,65 @@ function transferInstructions(raffle, order) {
     </section>`;
 }
 
-function raffleView(r, data) {
-  const raffle = data.raffle;
-  const taken = new Map(data.tickets.map((ticket) => [Number(ticket.number), ticket.status]));
-  const paidCount = data.tickets.filter((ticket) => ticket.status === "paid").length;
-  const pct = Math.round((paidCount / raffle.total_numbers) * 100);
-  const open = raffle.status === "open";
-  const numbers = Array.from({ length: raffle.total_numbers }, (_, i) => i + 1)
+function accountCard(raffle) {
+  if (!raffle.account_number) return "";
+  return `<section class="panel bloque">
+      <h2>Transfieres a esta cuenta</h2>
+      <div class="cuenta">
+        <div><span>Banco</span><strong>${esc(raffle.bank_name)}</strong></div>
+        <div><span>Tipo</span><strong>${esc(raffle.account_type)}</strong></div>
+        <div><span>Cuenta</span><strong>${esc(raffle.account_number)}</strong></div>
+        <div><span>RUT</span><strong>${esc(raffle.account_rut)}</strong></div>
+        <div><span>Titular</span><strong>${esc(raffle.account_holder)}</strong></div>
+      </div>
+      <button type="button" class="claro" data-copy="${esc(raffle.account_number)}">Copiar número de cuenta</button>
+      <p class="ayuda">El número queda pagado cuando ${esc(raffle.organizer_name)} confirma que llegó la transferencia.</p>
+    </section>`;
+}
+
+function safeImage(url) {
+  if (!url) return "";
+  if (String(url).startsWith("https://") || String(url).startsWith("data:image/")) return String(url);
+  return "";
+}
+
+function numberButtons(raffle, tickets) {
+  const taken = new Map(tickets.map((ticket) => [Number(ticket.number), ticket.status]));
+  const query = numberQuery.trim();
+  return Array.from({ length: raffle.total_numbers }, (_, index) => index + 1)
+    .filter((number) => {
+      const state = taken.get(number);
+      if (onlyFree && (state === "paid" || state === "reserved")) return false;
+      if (!query) return true;
+      return pad(number, raffle.total_numbers).includes(query) || String(number).includes(query);
+    })
     .map((number) => {
       const state = selected.has(number) ? "elegido" : taken.get(number) === "paid" ? "pagado" : taken.get(number) === "reserved" ? "reservado" : "";
-      const disabled = !open || state === "pagado" || state === "reservado";
+      const disabled = raffle.status !== "open" || state === "pagado" || state === "reservado";
       return `<button type="button" class="numero ${state} ${raffle.winner_number === number ? "ganador" : ""}" data-numero="${number}" ${disabled ? "disabled" : ""} aria-pressed="${selected.has(number)}">${pad(number, raffle.total_numbers)}</button>`;
     })
     .join("");
+}
+
+function raffleView(r, data) {
+  const raffle = data.raffle;
+  const tickets = data.tickets || [];
+  const paidCount = tickets.filter((ticket) => ticket.status === "paid").length;
+  const reservedCount = tickets.filter((ticket) => ticket.status === "reserved").length;
+  const freeCount = raffle.total_numbers - paidCount - reservedCount;
+  const pct = Math.round((paidCount / raffle.total_numbers) * 100);
+  const open = raffle.status === "open";
+  const numbers = numberButtons(raffle, tickets);
   const phone = digits(raffle.organizer_phone);
   const wa = `https://wa.me/${phone}?text=${encodeURIComponent(`Hola, te escribo por la rifa ${raffle.title}.`)}`;
   const share = `https://wa.me/?text=${encodeURIComponent(`Rifa: ${raffle.prize}. El número sale ${money(raffle.price_clp)}. Elige el tuyo aquí: ${publicUrl(raffle.id)}`)}`;
+  const image = safeImage(raffle.prize_image_url);
+  const when = formatWhen(raffle.draw_at);
   const winner = raffle.status === "drawn"
-    ? `<section class="ganador"><p>Número ganador</p><strong>${pad(raffle.winner_number, raffle.total_numbers)}</strong><p>Sorteado entre los números que alcanzaron a pagarse.</p></section>`
+    ? `<section class="ganador ganador-pagina"><p>Número ganador</p><strong>${pad(raffle.winner_number, raffle.total_numbers)}</strong><p>Sorteado entre los números que alcanzaron a pagarse.</p></section>`
     : "";
   const totalSel = selected.size * raffle.price_clp;
+  const picked = [...selected].sort((a, b) => a - b).map((number) => pad(number, raffle.total_numbers)).join(", ");
   const form = !raffle.account_number
     ? `<p class="alerta bloque">Esta rifa todavía no tiene una cuenta para transferir.</p>`
     : open && selected.size
@@ -674,13 +777,16 @@ function raffleView(r, data) {
       </form>`
     : "";
   return `${winner}
-    <section class="resumen">
+    <section class="portada">
       <div>
         <p class="estado">${esc(statusLabel(raffle.status))}</p>
-        <h1>${esc(raffle.title)}</h1>
-        <p class="lead">${esc(raffle.prize)}</p>
+        <h1>${esc(raffle.prize)}</h1>
+        <p class="lead">${esc(raffle.title)}</p>
+        <p class="precio">${money(raffle.price_clp)} <span class="muted">cada número</span></p>
+        <p><strong>${freeCount} libres</strong> <span class="muted">de ${raffle.total_numbers}</span></p>
+        ${when ? `<p class="muted">Sorteo: ${esc(when)}</p>` : ""}
       </div>
-      <p class="precio">${money(raffle.price_clp)} <span class="muted">c/u</span></p>
+      ${image ? `<img class="premio-foto" alt="Foto del premio: ${esc(raffle.prize)}" src="${esc(image)}" />` : `<article class="boleto"><div class="sello">Nº</div><p class="premio">${esc(raffle.prize)}</p></article>`}
     </section>
     ${transferInstructions(raffle, data.order)}
     ${raffle.description ? `<p>${esc(raffle.description)}</p>` : ""}
@@ -689,14 +795,22 @@ function raffleView(r, data) {
       <a class="btn btn-claro" href="${esc(share)}" target="_blank" rel="noopener">Compartir por WhatsApp</a>
       <button type="button" class="claro" data-copy="${esc(publicUrl(raffle.id))}">Copiar enlace</button>
     </div>
+    ${accountCard(raffle)}
     <section class="bloque">
       <div class="resumen"><strong>${paidCount} de ${raffle.total_numbers} pagados</strong><span>${pct}%</span></div>
       <div class="barra" aria-hidden="true"><span style="width:${pct}%"></span></div>
-      <div class="numeros">${numbers}</div>
+      <div class="filtros">
+        <button type="button" class="claro ${onlyFree ? "activo" : ""}" data-libres aria-pressed="${onlyFree}">Solo libres</button>
+        <button type="button" class="claro" data-azar ${open ? "" : "disabled"}>Elegir al azar</button>
+        <label class="buscar" for="buscar-numero">Buscar número
+          <input id="buscar-numero" inputmode="numeric" maxlength="3" placeholder="15" value="${esc(numberQuery)}" />
+        </label>
+      </div>
+      <div class="numeros">${numbers || `<p class="muted">No hay números con ese filtro.</p>`}</div>
       <p class="leyenda"><span><i class="punto libre"></i>Libre</span><span><i class="punto elegido"></i>Tu selección</span><span><i class="punto reservado"></i>Por confirmar</span><span><i class="punto pagado"></i>Pagado</span></p>
     </section>
     ${form}
-    ${open && selected.size ? `<div class="paybar"><p><strong>${selected.size}</strong> ${selected.size === 1 ? "número" : "números"} · ${money(totalSel)}</p><a class="btn btn-primario" href="#form-pago">Continuar</a></div>` : ""}`;
+    ${open && selected.size ? `<div class="paybar"><p><strong>${esc(picked)}</strong> · ${money(totalSel)}</p><a class="btn btn-primario" href="#form-pago">Continuar</a></div>` : ""}`;
 }
 
 function adminView(r, data) {
@@ -705,20 +819,19 @@ function adminView(r, data) {
   const paid = orders.filter((order) => order.status === "paid");
   const numbersPaid = paid.reduce((sum, order) => sum + (order.numbers || []).length, 0);
   const collected = paid.reduce((sum, order) => sum + Number(order.amount_clp), 0);
-  const rows = orders
-    .map((order) => {
-      const nums = (order.numbers || []).map((number) => pad(number, raffle.total_numbers)).join(", ");
-      const waiting = order.status === "reported" || order.status === "pending";
-      const label = order.status === "paid" ? "Pagado" : "Por confirmar";
-      return `<article class="tarjeta">
-        <div class="compra">
-          <div><strong>${esc(nums)}</strong><p>${esc(order.buyer_name)} · ${esc(order.buyer_email)}</p><p class="muted">${esc(showPhone(order.buyer_phone))} · ${label}${order.transfer_code ? ` · código ${esc(order.transfer_code)}` : ""}</p></div>
-          <strong>${money(order.amount_clp)}</strong>
-        </div>
-        ${waiting ? `<div class="acciones"><button type="button" class="primario" data-confirm="${esc(order.id)}">Confirmar pago</button><button type="button" class="claro" data-reject="${esc(order.id)}">Liberar número</button></div>` : ""}
-      </article>`;
-    })
-    .join("");
+  const waitingOrders = orders.filter((order) => order.status === "reported" || order.status === "pending");
+  const paidOrders = orders.filter((order) => order.status === "paid");
+  const card = (order) => {
+    const nums = (order.numbers || []).map((number) => pad(number, raffle.total_numbers)).join(", ");
+    const waiting = order.status === "reported" || order.status === "pending";
+    return `<article class="tarjeta">
+      <div class="compra">
+        <div><strong>${esc(nums)}</strong><p>${esc(order.buyer_name)} · ${esc(order.buyer_email)}</p><p class="muted">${esc(showPhone(order.buyer_phone))}${order.transfer_code ? ` · código ${esc(order.transfer_code)}` : ""}</p></div>
+        <strong>${money(order.amount_clp)}</strong>
+      </div>
+      ${waiting ? `<div class="acciones"><button type="button" class="primario" data-confirm="${esc(order.id)}">Confirmar pago</button><button type="button" class="claro" data-reject="${esc(order.id)}">Liberar número</button></div>` : ""}
+    </article>`;
+  };
   const controls = raffle.status === "drawn"
     ? ""
     : `<div class="acciones bloque">
@@ -729,7 +842,7 @@ function adminView(r, data) {
     <p class="estado">${esc(statusLabel(raffle.status))}</p>
     <h1>${esc(raffle.title)}</h1>
     <p class="lead">${esc(raffle.prize)}</p>
-    ${raffle.status === "drawn" ? `<section class="ganador"><p>Número ganador</p><strong>${pad(raffle.winner_number, raffle.total_numbers)}</strong></section>` : ""}
+    ${raffle.status === "drawn" ? `<section class="ganador ganador-pagina"><p>Número ganador</p><strong>${pad(raffle.winner_number, raffle.total_numbers)}</strong></section>` : ""}
     ${errorMsg ? `<p class="alerta">${esc(errorMsg)}</p>` : ""}
     <div class="pasos">
       <article class="tarjeta"><strong>${numbersPaid}</strong><p class="muted">números pagados</p></article>
@@ -742,7 +855,14 @@ function adminView(r, data) {
       <button type="button" class="claro" data-csv>Descargar lista</button>
     </div>
     ${controls}
-    <section class="bloque lista">${rows || `<p class="muted">Todavía no hay compras.</p>`}</section>`;
+    <section class="bloque">
+      <h2>Por confirmar</h2>
+      <div class="lista">${waitingOrders.map(card).join("") || `<p class="muted">No hay transferencias esperando.</p>`}</div>
+    </section>
+    <section class="bloque">
+      <h2>Pagados</h2>
+      <div class="lista">${paidOrders.map(card).join("") || `<p class="muted">Todavía no hay números pagados.</p>`}</div>
+    </section>`;
 }
 
 function view(r, data) {
@@ -824,6 +944,8 @@ async function render(scrollTop) {
     cache = null;
     cacheKey = key;
     buyer = { name: "", email: "", phone: "" };
+    onlyFree = false;
+    numberQuery = "";
     paint(true);
   }
   try {
@@ -886,6 +1008,33 @@ document.body.addEventListener("click", async (event) => {
   const copy = event.target.closest("[data-copy]");
   if (copy) {
     copyText(copy.dataset.copy);
+    return;
+  }
+
+  if (event.target.closest("[data-libres]")) {
+    onlyFree = !onlyFree;
+    paint(false);
+    return;
+  }
+
+  if (event.target.closest("[data-azar]") && cache?.raffle?.status === "open") {
+    const taken = new Set(
+      (cache.tickets || [])
+        .filter((ticket) => ticket.status === "paid" || ticket.status === "reserved")
+        .map((ticket) => Number(ticket.number)),
+    );
+    const free = [];
+    for (let number = 1; number <= cache.raffle.total_numbers; number += 1) {
+      if (!taken.has(number) && !selected.has(number)) free.push(number);
+    }
+    if (!free.length) aviso("No quedan números libres.");
+    else if (selected.size >= 15) aviso("Puedes llevar hasta 15 números por reserva.");
+    else {
+      const bytes = new Uint32Array(1);
+      crypto.getRandomValues(bytes);
+      selected.add(free[bytes[0] % free.length]);
+      paint(false);
+    }
     return;
   }
 
@@ -961,6 +1110,12 @@ document.body.addEventListener("click", async (event) => {
 });
 
 document.body.addEventListener("input", (event) => {
+  if (event.target.id === "buscar-numero") {
+    numberQuery = event.target.value;
+    const box = document.querySelector(".numeros");
+    if (box && cache?.raffle) box.innerHTML = numberButtons(cache.raffle, cache.tickets || []) || `<p class="muted">No hay números con ese filtro.</p>`;
+    return;
+  }
   const form = event.target.closest("#form-pago");
   if (!form) return;
   buyer = {
@@ -968,6 +1123,43 @@ document.body.addEventListener("input", (event) => {
     email: form.email.value,
     phone: form.phone.value,
   };
+});
+
+document.body.addEventListener("change", async (event) => {
+  if (event.target.id !== "foto") return;
+  const file = event.target.files?.[0];
+  const form = event.target.form;
+  if (!file || !form) return;
+  try {
+    const image = await compressImage(file);
+    draft = {
+      title: form.title.value,
+      prize: form.prize.value,
+      description: form.description.value,
+      price: form.price.value,
+      total: form.total.value,
+      organizer: form.organizer.value,
+      phone: form.phone.value,
+      bank: form.bank.value,
+      bankOther: form.bankOther.value,
+      accountType: form.accountType.value,
+      accountNumber: form.accountNumber.value,
+      rut: form.rut.value,
+      holder: form.holder.value,
+      prizeImage: image,
+      drawAt: form.drawAt.value,
+    };
+    if (image.length > 200000) {
+      errorMsg = "La foto quedó muy pesada. Elige una más chica.";
+      draft.prizeImage = "";
+    } else {
+      errorMsg = "";
+    }
+    paint(false);
+  } catch (error) {
+    errorMsg = error.message;
+    paint(false);
+  }
 });
 
 document.body.addEventListener("submit", async (event) => {
@@ -989,7 +1181,20 @@ document.body.addEventListener("submit", async (event) => {
       accountNumber: form.accountNumber.value,
       rut: form.rut.value,
       holder: form.holder.value,
+      prizeImage: draft.prizeImage,
+      drawAt: form.drawAt.value,
     };
+    const image = (draft.prizeImage || "").trim();
+    if (image && image.length > 200000) {
+      errorMsg = "La foto quedó muy pesada. Elige una más chica.";
+      paint(false);
+      return;
+    }
+    if (draft.drawAt && Number.isNaN(new Date(draft.drawAt).getTime())) {
+      errorMsg = "La fecha del sorteo no es válida.";
+      paint(false);
+      return;
+    }
     const bankName = draft.bank === "Otro" ? draft.bankOther.trim() : draft.bank;
     if (!validRut(draft.rut)) {
       errorMsg = "El RUT de la cuenta no es válido.";
@@ -1019,6 +1224,8 @@ document.body.addEventListener("submit", async (event) => {
       account_number: digits(draft.accountNumber),
       account_rut: formatRut(draft.rut),
       account_holder: draft.holder.trim(),
+      prize_image_url: image,
+      draw_at: draft.drawAt ? new Date(draft.drawAt).toISOString() : null,
     };
     if (input.organizer_phone.length < 8) {
       errorMsg = "Escribe un WhatsApp con código de país, por ejemplo +56 9 1234 5678.";

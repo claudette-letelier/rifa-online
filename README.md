@@ -15,7 +15,7 @@ La dirección queda como `https://TU-USUARIO.github.io/rifa-online/`.
 ## Conectar Supabase
 
 1. Crea un proyecto en [Supabase](https://supabase.com).
-2. En el SQL Editor ejecuta `supabase/migrations/001_rifa.sql` y después `supabase/migrations/002_transferencia.sql`. Si `001` ya corrió, basta con ejecutar `002`.
+2. En el SQL Editor ejecuta, en orden, `supabase/migrations/001_rifa.sql`, `002_transferencia.sql` y `003_portada.sql`. Si las primeras ya corrieron, basta con ejecutar las que falten.
 3. En Project Settings → API, copia la URL y la clave `anon` en `site/js/config.js`:
 
 ```js
