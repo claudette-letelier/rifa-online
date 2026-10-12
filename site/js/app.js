@@ -1,0 +1,875 @@
+const cfg = window.RIFA_CONFIG || {};
+const live = Boolean(cfg.supabaseUrl && cfg.supabaseAnonKey);
+const DEMO_KEY = "rifa-online-demo";
+const MINE_KEY = "rifa-online-mine";
+
+let supabase = null;
+let cache = null;
+let cacheKey = "";
+let selected = new Set();
+let buyer = { name: "", email: "", phone: "" };
+let draft = { title: "", prize: "", description: "", price: "2000", total: "100", organizer: "", phone: "" };
+let busy = false;
+let errorMsg = "";
+let renderGen = 0;
+let pollTimer = 0;
+let avisoTimer = 0;
+
+const clp = new Intl.NumberFormat("es-CL", {
+  style: "currency",
+  currency: "CLP",
+  maximumFractionDigits: 0,
+});
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[ch]));
+}
+
+function money(value) {
+  return clp.format(Number(value) || 0);
+}
+
+function pad(n, total) {
+  return String(n).padStart(total >= 100 ? 3 : 2, "0");
+}
+
+function digits(value) {
+  return String(value ?? "").replace(/\D/g, "");
+}
+
+function chilePhone(value) {
+  const phone = digits(value);
+  if (phone.startsWith("56")) return phone;
+  if (phone.length === 9 && phone.startsWith("9")) return `56${phone}`;
+  return phone;
+}
+
+function showPhone(value) {
+  const phone = digits(value);
+  if (phone.length === 11 && phone.startsWith("56")) {
+    return `+${phone.slice(0, 2)} ${phone.slice(2, 3)} ${phone.slice(3, 7)} ${phone.slice(7)}`;
+  }
+  return phone || "sin teléfono";
+}
+
+function pageBase() {
+  return new URL("./", location.href).href.replace(/\/$/, "");
+}
+
+function publicUrl(id) {
+  return `${pageBase()}/?rifa=${encodeURIComponent(id)}`;
+}
+
+function adminUrl(id, token) {
+  return `${pageBase()}/?admin=${encodeURIComponent(id)}&clave=${encodeURIComponent(token)}`;
+}
+
+function route() {
+  const q = new URLSearchParams(location.search);
+  if (q.get("nueva") === "1") return { name: "create" };
+  if (q.get("admin")) {
+    return { name: "admin", id: q.get("admin"), token: q.get("clave") || "" };
+  }
+  if (q.get("rifa")) {
+    return {
+      name: "raffle",
+      id: q.get("rifa"),
+      pago: q.get("pago") || "",
+      orden: q.get("orden") || "",
+    };
+  }
+  return { name: "home" };
+}
+
+function dataKey(r) {
+  return `${r.name}:${r.id || ""}:${r.token || ""}`;
+}
+
+function go(params) {
+  const url = new URL(location.href);
+  url.hash = "";
+  [...url.searchParams.keys()].forEach((key) => url.searchParams.delete(key));
+  Object.entries(params).forEach(([key, value]) => {
+    if (value != null && value !== "") url.searchParams.set(key, value);
+  });
+  history.pushState({}, "", `${url.pathname}${url.search}`);
+  selected = new Set();
+  errorMsg = "";
+  render(true);
+}
+
+function readMine() {
+  try {
+    return JSON.parse(localStorage.getItem(MINE_KEY) || "[]");
+  } catch {
+    return [];
+  }
+}
+
+function remember(entry) {
+  const next = [entry, ...readMine().filter((item) => item.id !== entry.id)].slice(0, 20);
+  localStorage.setItem(MINE_KEY, JSON.stringify(next));
+}
+
+function aviso(message) {
+  const el = document.querySelector("#aviso");
+  el.textContent = message;
+  clearTimeout(avisoTimer);
+  avisoTimer = setTimeout(() => {
+    el.textContent = "";
+  }, 2400);
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    aviso("Enlace copiado");
+  } catch {
+    aviso("No se pudo copiar. Selecciona el enlace y cópialo a mano.");
+  }
+}
+
+function demoLoad() {
+  const raw = localStorage.getItem(DEMO_KEY);
+  if (raw) return JSON.parse(raw);
+  const id = crypto.randomUUID();
+  const orderId = crypto.randomUUID();
+  const db = {
+    raffles: [
+      {
+        id,
+        title: "Rifa de la junta de vecinos",
+        prize: "Gift card de $80.000",
+        description: "Ejemplo para recorrer la página. En el modo demostración nadie paga de verdad.",
+        price_clp: 2000,
+        total_numbers: 50,
+        organizer_name: "Ana Pérez",
+        organizer_phone: "56912345678",
+        admin_token: "demo-clave",
+        status: "open",
+        winner_number: null,
+        drawn_at: null,
+        created_at: new Date().toISOString(),
+      },
+    ],
+    orders: [
+      {
+        id: orderId,
+        raffle_id: id,
+        buyer_name: "Luis Soto",
+        buyer_email: "luis@example.com",
+        buyer_phone: "56911111111",
+        amount_clp: 2000,
+        status: "paid",
+        reserved_until: new Date().toISOString(),
+        paid_at: new Date().toISOString(),
+        numbers: [7],
+      },
+    ],
+  };
+  localStorage.setItem(DEMO_KEY, JSON.stringify(db));
+  return db;
+}
+
+function demoSave(db) {
+  localStorage.setItem(DEMO_KEY, JSON.stringify(db));
+}
+
+function purgeExpired(db, raffleId) {
+  const now = Date.now();
+  db.orders = db.orders.filter((order) => {
+    if (order.raffle_id !== raffleId || order.status !== "pending") return true;
+    return new Date(order.reserved_until).getTime() > now;
+  });
+}
+
+const demoApi = {
+  async getRaffle(id) {
+    const db = demoLoad();
+    purgeExpired(db, id);
+    demoSave(db);
+    const raffle = db.raffles.find((item) => item.id === id);
+    if (!raffle) throw new Error("No encontramos esta rifa. Revisa el enlace.");
+    const tickets = db.orders
+      .filter((order) => order.raffle_id === id && (order.status === "paid" || order.status === "pending"))
+      .flatMap((order) => order.numbers.map((number) => ({ number, status: order.status === "paid" ? "paid" : "reserved" })));
+    return { raffle, tickets };
+  },
+  async orderStatus(orderId) {
+    const order = demoLoad().orders.find((item) => item.id === orderId);
+    if (!order) return null;
+    return { status: order.status, raffle_id: order.raffle_id, numbers: order.numbers };
+  },
+  async createRaffle(input) {
+    const db = demoLoad();
+    const id = crypto.randomUUID();
+    const admin_token = crypto.randomUUID().replaceAll("-", "");
+    db.raffles.unshift({
+      id,
+      ...input,
+      admin_token,
+      status: "open",
+      winner_number: null,
+      drawn_at: null,
+      created_at: new Date().toISOString(),
+    });
+    demoSave(db);
+    return { id, admin_token };
+  },
+  async checkout(input) {
+    const db = demoLoad();
+    purgeExpired(db, input.raffleId);
+    const raffle = db.raffles.find((item) => item.id === input.raffleId);
+    if (!raffle || raffle.status !== "open") throw new Error("Esta rifa ya no está vendiendo números.");
+    const taken = new Set(
+      db.orders
+        .filter((order) => order.raffle_id === input.raffleId)
+        .flatMap((order) => order.numbers),
+    );
+    if (input.numbers.some((number) => taken.has(number))) {
+      throw new Error("Alguien acaba de tomar uno de esos números. Elige otros.");
+    }
+    const order = {
+      id: crypto.randomUUID(),
+      raffle_id: input.raffleId,
+      buyer_name: input.buyerName.trim(),
+      buyer_email: input.buyerEmail.trim().toLowerCase(),
+      buyer_phone: digits(input.buyerPhone),
+      amount_clp: raffle.price_clp * input.numbers.length,
+      status: "paid",
+      reserved_until: new Date().toISOString(),
+      paid_at: new Date().toISOString(),
+      numbers: input.numbers,
+    };
+    db.orders.unshift(order);
+    demoSave(db);
+    return { demoPaid: true, orderId: order.id };
+  },
+  async getAdmin(id, token) {
+    const db = demoLoad();
+    const raffle = db.raffles.find((item) => item.id === id && item.admin_token === token);
+    if (!raffle) throw new Error("Este enlace de organización no es válido.");
+    const orders = db.orders.filter((order) => order.raffle_id === id && order.status === "paid");
+    return { raffle, orders };
+  },
+  async setStatus(id, token, status) {
+    const db = demoLoad();
+    const raffle = db.raffles.find((item) => item.id === id && item.admin_token === token);
+    if (!raffle || raffle.status === "drawn") throw new Error("No se puede cambiar el estado de esta rifa.");
+    raffle.status = status;
+    demoSave(db);
+  },
+  async draw(id, token) {
+    const db = demoLoad();
+    const raffle = db.raffles.find((item) => item.id === id && item.admin_token === token);
+    if (!raffle) throw new Error("Este enlace de organización no es válido.");
+    if (raffle.status === "drawn") throw new Error("Esta rifa ya tiene ganador.");
+    const numbers = db.orders
+      .filter((order) => order.raffle_id === id && order.status === "paid")
+      .flatMap((order) => order.numbers);
+    if (!numbers.length) throw new Error("Todavía no hay números pagados para sortear.");
+    const bytes = new Uint32Array(1);
+    crypto.getRandomValues(bytes);
+    raffle.winner_number = numbers[bytes[0] % numbers.length];
+    raffle.status = "drawn";
+    raffle.drawn_at = new Date().toISOString();
+    demoSave(db);
+    return { winner_number: raffle.winner_number };
+  },
+};
+
+const liveApi = {
+  async client() {
+    if (!supabase) {
+      const { createClient } = await import("https://esm.sh/@supabase/supabase-js@2.49.1");
+      supabase = createClient(cfg.supabaseUrl, cfg.supabaseAnonKey);
+    }
+    return supabase;
+  },
+  async getRaffle(id) {
+    const sb = await this.client();
+    const raffleRes = await sb.from("raffle_public").select("*").eq("id", id).maybeSingle();
+    if (raffleRes.error) throw new Error("No pudimos cargar la rifa.");
+    if (!raffleRes.data) throw new Error("No encontramos esta rifa. Revisa el enlace.");
+    const ticketsRes = await sb.from("ticket_public").select("number,status").eq("raffle_id", id);
+    if (ticketsRes.error) throw new Error("No pudimos cargar los números.");
+    return { raffle: raffleRes.data, tickets: ticketsRes.data || [] };
+  },
+  async orderStatus(orderId) {
+    const sb = await this.client();
+    const { data, error } = await sb.rpc("order_status", { p_order_id: orderId });
+    if (error) return null;
+    return data;
+  },
+  async createRaffle(input) {
+    const sb = await this.client();
+    const { data, error } = await sb.rpc("create_raffle", {
+      p_title: input.title,
+      p_prize: input.prize,
+      p_description: input.description,
+      p_price: input.price_clp,
+      p_total: input.total_numbers,
+      p_organizer_name: input.organizer_name,
+      p_organizer_phone: input.organizer_phone,
+    });
+    if (error || !data) throw new Error("Revisa los datos. El precio va entre $1.000 y $200.000, y los números entre 10 y 300.");
+    return data;
+  },
+  async checkout(input) {
+    const response = await fetch(`${cfg.supabaseUrl}/functions/v1/create-checkout`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: cfg.supabaseAnonKey,
+        Authorization: `Bearer ${cfg.supabaseAnonKey}`,
+      },
+      body: JSON.stringify(input),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(body.message || "No se pudo iniciar el pago.");
+    }
+    return body;
+  },
+  async getAdmin(id, token) {
+    const sb = await this.client();
+    const { data, error } = await sb.rpc("get_admin_raffle", {
+      p_raffle_id: id,
+      p_token: token,
+    });
+    if (error || !data) throw new Error("Este enlace de organización no es válido.");
+    return data;
+  },
+  async setStatus(id, token, status) {
+    const sb = await this.client();
+    const { error } = await sb.rpc("set_raffle_status", {
+      p_raffle_id: id,
+      p_token: token,
+      p_status: status,
+    });
+    if (error) throw new Error("No se puede cambiar el estado de esta rifa.");
+  },
+  async draw(id, token) {
+    const sb = await this.client();
+    const { data, error } = await sb.rpc("draw_winner", {
+      p_raffle_id: id,
+      p_token: token,
+    });
+    if (error) throw new Error("No se pudo sortear. Confirma que haya números pagados y que la rifa no tenga ganador.");
+    return data;
+  },
+};
+
+const api = live ? liveApi : demoApi;
+
+function statusLabel(status) {
+  if (status === "closed") return "Ventas cerradas";
+  if (status === "drawn") return "Sorteada";
+  return "Vendiendo";
+}
+
+function homeView(data) {
+  const sample = data.sampleId
+    ? `<a class="btn btn-claro" href="./?rifa=${esc(data.sampleId)}" data-go="raffle" data-id="${esc(data.sampleId)}">Ver rifa de ejemplo</a>`
+    : "";
+  const mine = data.mine.length
+    ? `<section class="bloque"><h2>Rifas de este navegador</h2><div class="lista">${data.mine
+        .map(
+          (item) => `<article class="tarjeta compra">
+            <div><strong>${esc(item.title)}</strong><p class="muted">${esc(item.prize)}</p></div>
+            <a class="btn btn-navy" href="${esc(adminUrl(item.id, item.token))}" data-go="admin" data-id="${esc(item.id)}" data-token="${esc(item.token)}">Organizar</a>
+          </article>`,
+        )
+        .join("")}</div></section>`
+    : "";
+  return `<section class="hero">
+      <div>
+        <h1>La rifa se comparte por enlace, no en una hoja.</h1>
+        <p class="lead">Armas el premio, publicas los números y la gente en cualquier parte de Chile elige el suyo y paga en línea. Tú ves al tiro quién compró cada número.</p>
+        <div class="acciones">
+          <a class="btn btn-primario" href="./?nueva=1" data-go="create">Armar una rifa</a>
+          ${sample}
+        </div>
+      </div>
+      <article class="boleto">
+        <div class="sello">Nº 07</div>
+        <p class="muted">Premio</p>
+        <p class="premio">Un solo enlace para toda la rifa</p>
+        <p class="muted">WhatsApp, Instagram o el grupo del curso. Quien abre el enlace ve los números libres.</p>
+      </article>
+    </section>
+    <section class="pasos">
+      <article class="tarjeta"><strong>1. Publicas</strong><p class="muted">Premio, precio y cuántos números. Guardas el enlace de organización.</p></article>
+      <article class="tarjeta"><strong>2. Eligen y pagan</strong><p class="muted">Cada persona marca sus números. Mercado Pago cobra y el número queda tomado.</p></article>
+      <article class="tarjeta"><strong>3. Sorteas</strong><p class="muted">Cuando cierres las ventas, el sitio elige al azar entre los números pagados.</p></article>
+    </section>
+    ${mine}`;
+}
+
+function createView() {
+  return `<section class="formulario">
+      <h1>Armar rifa</h1>
+      <p class="lead">Después vas a recibir un enlace público para compartir y otro privado para ver pagos y sortear.</p>
+      ${errorMsg ? `<p class="alerta">${esc(errorMsg)}</p>` : ""}
+      <form id="form-rifa">
+        <label for="titulo">Nombre de la rifa</label>
+        <input id="titulo" name="title" required minlength="3" maxlength="80" placeholder="Rifa curso 4º medio" value="${esc(draft.title)}" />
+        <label for="premio">Premio</label>
+        <input id="premio" name="prize" required minlength="3" maxlength="140" placeholder="Bicicleta o gift card" value="${esc(draft.prize)}" />
+        <label for="detalle">Detalle</label>
+        <textarea id="detalle" name="description" maxlength="500" placeholder="Cómo se entrega el premio y cualquier condición.">${esc(draft.description)}</textarea>
+        <label for="precio">Precio por número</label>
+        <input id="precio" name="price" type="number" min="1000" max="200000" step="500" required value="${esc(draft.price)}" />
+        <p class="ayuda">Entre $1.000 y $200.000 pesos.</p>
+        <label for="total">Cantidad de números</label>
+        <select id="total" name="total">
+          <option value="50" ${draft.total === "50" ? "selected" : ""}>50</option>
+          <option value="100" ${draft.total === "100" ? "selected" : ""}>100</option>
+          <option value="200" ${draft.total === "200" ? "selected" : ""}>200</option>
+        </select>
+        <label for="org">Tu nombre</label>
+        <input id="org" name="organizer" required minlength="3" maxlength="80" value="${esc(draft.organizer)}" />
+        <label for="fono">WhatsApp de contacto</label>
+        <input id="fono" name="phone" required inputmode="tel" placeholder="+56 9 1234 5678" value="${esc(draft.phone)}" />
+        <p class="ayuda">Sale en la rifa para que te escriban. El pago lo recibe la cuenta de Mercado Pago de este sitio${cfg.collectorName ? `, a nombre de ${esc(cfg.collectorName)}` : ""}.</p>
+        <p class="honeypot" aria-hidden="true"><label>Empresa<input name="company" tabindex="-1" autocomplete="off" /></label></p>
+        <button class="primario" type="submit" ${busy ? "disabled" : ""}>${busy ? "Creando…" : "Publicar rifa"}</button>
+      </form>
+    </section>`;
+}
+
+function paymentBanner(r, order) {
+  if (r.pago === "error") {
+    return `<p class="alerta">El pago no se completó. Si no te cobraron, puedes elegir los números otra vez.</p>`;
+  }
+  if (r.pago === "pendiente") {
+    return `<p class="espera">Mercado Pago dejó el pago pendiente. Si se aprueba, los números se marcan solos.</p>`;
+  }
+  if (r.pago === "ok" || r.orden) {
+    if (order?.status === "paid") {
+      const nums = (order.numbers || []).map((n) => pad(n, cache.raffle.total_numbers)).join(", ");
+      return `<p class="ok">Pago confirmado. Tus números: ${esc(nums)}.</p>`;
+    }
+    if (r.pago === "ok") return `<p class="espera">Estamos confirmando tu pago con Mercado Pago…</p>`;
+  }
+  return "";
+}
+
+function raffleView(r, data) {
+  const raffle = data.raffle;
+  const taken = new Map(data.tickets.map((ticket) => [Number(ticket.number), ticket.status]));
+  const paidCount = data.tickets.filter((ticket) => ticket.status === "paid").length;
+  const pct = Math.round((paidCount / raffle.total_numbers) * 100);
+  const open = raffle.status === "open";
+  const numbers = Array.from({ length: raffle.total_numbers }, (_, i) => i + 1)
+    .map((number) => {
+      const state = selected.has(number) ? "elegido" : taken.get(number) === "paid" ? "pagado" : taken.get(number) === "reserved" ? "reservado" : "";
+      const disabled = !open || state === "pagado" || state === "reservado";
+      return `<button type="button" class="numero ${state} ${raffle.winner_number === number ? "ganador" : ""}" data-numero="${number}" ${disabled ? "disabled" : ""} aria-pressed="${selected.has(number)}">${pad(number, raffle.total_numbers)}</button>`;
+    })
+    .join("");
+  const phone = digits(raffle.organizer_phone);
+  const wa = `https://wa.me/${phone}?text=${encodeURIComponent(`Hola, te escribo por la rifa ${raffle.title}.`)}`;
+  const share = `https://wa.me/?text=${encodeURIComponent(`Rifa: ${raffle.prize}. El número sale ${money(raffle.price_clp)}. Elige el tuyo aquí: ${publicUrl(raffle.id)}`)}`;
+  const winner = raffle.status === "drawn"
+    ? `<section class="ganador"><p>Número ganador</p><strong>${pad(raffle.winner_number, raffle.total_numbers)}</strong><p>Sorteado entre los números que alcanzaron a pagarse.</p></section>`
+    : "";
+  const totalSel = selected.size * raffle.price_clp;
+  const form = open && selected.size
+    ? `<form id="form-pago" class="panel bloque">
+        <h2>Tus datos</h2>
+        ${errorMsg ? `<p class="alerta">${esc(errorMsg)}</p>` : ""}
+        <label for="nombre">Nombre</label>
+        <input id="nombre" name="name" required minlength="3" maxlength="80" autocomplete="name" value="${esc(buyer.name)}" />
+        <label for="correo">Correo</label>
+        <input id="correo" name="email" type="email" required maxlength="120" autocomplete="email" value="${esc(buyer.email)}" />
+        <label for="comprador">WhatsApp</label>
+        <input id="comprador" name="phone" required inputmode="tel" autocomplete="tel" value="${esc(buyer.phone)}" />
+        <button class="primario" type="submit" ${busy ? "disabled" : ""}>${busy ? "Abriendo pago…" : live ? `Pagar ${money(totalSel)} con Mercado Pago` : `Simular pago de ${money(totalSel)}`}</button>
+        <p class="ayuda">${live ? "El número queda reservado 20 minutos mientras pagas." : "Modo demostración: no se cobra dinero real."}</p>
+      </form>`
+    : "";
+  return `${winner}
+    <section class="resumen">
+      <div>
+        <p class="estado">${esc(statusLabel(raffle.status))}</p>
+        <h1>${esc(raffle.title)}</h1>
+        <p class="lead">${esc(raffle.prize)}</p>
+      </div>
+      <p class="precio">${money(raffle.price_clp)} <span class="muted">c/u</span></p>
+    </section>
+    ${paymentBanner(r, data.order)}
+    ${raffle.description ? `<p>${esc(raffle.description)}</p>` : ""}
+    <p class="muted">Organiza ${esc(raffle.organizer_name)}. <a href="${esc(wa)}" target="_blank" rel="noopener">Escribir por WhatsApp</a></p>
+    <div class="acciones">
+      <a class="btn btn-claro" href="${esc(share)}" target="_blank" rel="noopener">Compartir por WhatsApp</a>
+      <button type="button" class="claro" data-copy="${esc(publicUrl(raffle.id))}">Copiar enlace</button>
+    </div>
+    <section class="bloque">
+      <div class="resumen"><strong>${paidCount} de ${raffle.total_numbers} pagados</strong><span>${pct}%</span></div>
+      <div class="barra" aria-hidden="true"><span style="width:${pct}%"></span></div>
+      <div class="numeros">${numbers}</div>
+      <p class="leyenda"><span><i class="punto libre"></i>Libre</span><span><i class="punto elegido"></i>Tu selección</span><span><i class="punto reservado"></i>En pago</span><span><i class="punto pagado"></i>Pagado</span></p>
+    </section>
+    ${form}
+    ${open && selected.size ? `<div class="paybar"><p><strong>${selected.size}</strong> ${selected.size === 1 ? "número" : "números"} · ${money(totalSel)}</p><a class="btn btn-primario" href="#form-pago">Continuar</a></div>` : ""}`;
+}
+
+function adminView(r, data) {
+  const raffle = data.raffle;
+  const orders = data.orders || [];
+  const paid = orders.filter((order) => order.status === "paid");
+  const numbersPaid = paid.reduce((sum, order) => sum + order.numbers.length, 0);
+  const collected = paid.reduce((sum, order) => sum + Number(order.amount_clp), 0);
+  const rows = orders
+    .map((order) => {
+      const nums = order.numbers.map((number) => pad(number, raffle.total_numbers)).join(", ");
+      return `<article class="tarjeta compra">
+        <div><strong>${esc(nums)}</strong><p>${esc(order.buyer_name)} · ${esc(order.buyer_email)}</p><p class="muted">${esc(showPhone(order.buyer_phone))} · ${esc(order.status === "paid" ? "Pagado" : "Reservado")}</p></div>
+        <strong>${money(order.amount_clp)}</strong>
+      </article>`;
+    })
+    .join("");
+  const controls = raffle.status === "drawn"
+    ? ""
+    : `<div class="acciones bloque">
+        ${raffle.status === "open" ? `<button type="button" class="claro" data-status="closed">Cerrar ventas</button>` : `<button type="button" class="claro" data-status="open">Reabrir ventas</button>`}
+        <button type="button" class="primario" data-draw>Sortear entre pagados</button>
+      </div>`;
+  return `<p class="alerta">Guarda este enlace. Es la llave para ver compradores y sortear, y no se puede recuperar si la pierdes.</p>
+    <p class="estado">${esc(statusLabel(raffle.status))}</p>
+    <h1>${esc(raffle.title)}</h1>
+    <p class="lead">${esc(raffle.prize)}</p>
+    ${raffle.status === "drawn" ? `<section class="ganador"><p>Número ganador</p><strong>${pad(raffle.winner_number, raffle.total_numbers)}</strong></section>` : ""}
+    ${errorMsg ? `<p class="alerta">${esc(errorMsg)}</p>` : ""}
+    <div class="pasos">
+      <article class="tarjeta"><strong>${numbersPaid}</strong><p class="muted">números pagados</p></article>
+      <article class="tarjeta"><strong>${money(collected)}</strong><p class="muted">recaudado</p></article>
+      <article class="tarjeta"><strong>${money(raffle.price_clp)}</strong><p class="muted">precio por número</p></article>
+    </div>
+    <div class="acciones bloque">
+      <a class="btn btn-navy" href="${esc(publicUrl(raffle.id))}" data-go="raffle" data-id="${esc(raffle.id)}">Ver como comprador</a>
+      <button type="button" class="claro" data-copy="${esc(publicUrl(raffle.id))}">Copiar enlace público</button>
+      <button type="button" class="claro" data-csv>Descargar lista</button>
+    </div>
+    ${controls}
+    <section class="bloque lista">${rows || `<p class="muted">Todavía no hay compras.</p>`}</section>`;
+}
+
+function view(r, data) {
+  if (r.name === "home") return homeView(data);
+  if (r.name === "create") return createView();
+  if (r.name === "raffle") return raffleView(r, data);
+  return adminView(r, data);
+}
+
+async function load(r) {
+  if (r.name === "home") {
+    return { mine: readMine(), sampleId: live ? null : demoLoad().raffles[0].id };
+  }
+  if (r.name === "create") return {};
+  if (r.name === "raffle") {
+    const data = await api.getRaffle(r.id);
+    const order = r.orden ? await api.orderStatus(r.orden) : null;
+    return { ...data, order };
+  }
+  return api.getAdmin(r.id, r.token);
+}
+
+function paint(scrollTop) {
+  const r = route();
+  if (r.name === "raffle" && cache?.tickets) {
+    const taken = new Set(
+      cache.tickets
+        .filter((ticket) => ticket.status === "paid" || ticket.status === "reserved")
+        .map((ticket) => Number(ticket.number)),
+    );
+    selected.forEach((number) => {
+      if (taken.has(number)) selected.delete(number);
+    });
+  }
+  const y = scrollTop ? 0 : window.scrollY;
+  document.querySelector("#contenido").innerHTML = cache
+    ? view(r, cache)
+    : `<p class="cargando">Cargando…</p>`;
+  document.body.classList.toggle("con-barra", Boolean(document.querySelector(".paybar")));
+  document.title = r.name === "create"
+    ? "Armar rifa · Rifa Online"
+    : r.name === "raffle"
+      ? `${cache?.raffle?.title || "Rifa"} · Rifa Online`
+      : r.name === "admin"
+        ? `Organizar · ${cache?.raffle?.title || "Rifa Online"}`
+        : "Rifa Online";
+  window.scrollTo(0, y);
+}
+
+function stopPoll() {
+  clearInterval(pollTimer);
+  pollTimer = 0;
+}
+
+function armPoll(r) {
+  stopPoll();
+  if (r.name !== "raffle" && r.name !== "admin") return;
+  pollTimer = setInterval(async () => {
+    const active = document.activeElement;
+    if (active && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName)) return;
+    const gen = renderGen;
+    try {
+      const fresh = await load(route());
+      if (gen !== renderGen) return;
+      cache = fresh;
+      paint(false);
+    } catch {
+      // La siguiente visita muestra el error si la rifa dejó de cargar.
+    }
+  }, 8000);
+}
+
+async function render(scrollTop) {
+  const gen = ++renderGen;
+  stopPoll();
+  const r = route();
+  const key = dataKey(r);
+  if (key !== cacheKey) {
+    cache = null;
+    cacheKey = key;
+    buyer = { name: "", email: "", phone: "" };
+    paint(true);
+  }
+  try {
+    const fresh = await load(r);
+    if (gen !== renderGen) return;
+    cache = fresh;
+    paint(scrollTop);
+    armPoll(r);
+  } catch (error) {
+    if (gen !== renderGen) return;
+    document.querySelector("#contenido").innerHTML = `<p class="alerta">${esc(error.message || "No se pudo cargar.")}</p>`;
+  }
+}
+
+function readBuyer(form) {
+  buyer = {
+    name: form.name.value,
+    email: form.email.value,
+    phone: form.phone.value,
+  };
+  return buyer;
+}
+
+function downloadCsv(raffle, orders) {
+  const lines = [["numero", "nombre", "correo", "telefono", "estado", "monto_clp"]];
+  orders.forEach((order) => {
+    order.numbers.forEach((number) => {
+      lines.push([
+        number,
+        order.buyer_name,
+        order.buyer_email,
+        order.buyer_phone || "",
+        order.status,
+        order.amount_clp,
+      ]);
+    });
+  });
+  const csv = lines
+    .map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(","))
+    .join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `${raffle.title.slice(0, 40)}-compradores.csv`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+document.body.addEventListener("click", async (event) => {
+  const link = event.target.closest("[data-go]");
+  if (link) {
+    event.preventDefault();
+    if (link.dataset.go === "home") go({});
+    else if (link.dataset.go === "create") go({ nueva: "1" });
+    else if (link.dataset.go === "raffle") go({ rifa: link.dataset.id });
+    else if (link.dataset.go === "admin") go({ admin: link.dataset.id, clave: link.dataset.token });
+    return;
+  }
+
+  const copy = event.target.closest("[data-copy]");
+  if (copy) {
+    copyText(copy.dataset.copy);
+    return;
+  }
+
+  const number = event.target.closest("[data-numero]");
+  if (number && cache?.raffle?.status === "open") {
+    const value = Number(number.dataset.numero);
+    if (selected.has(value)) selected.delete(value);
+    else if (selected.size < 15) selected.add(value);
+    else aviso("Puedes llevar hasta 15 números por pago.");
+    errorMsg = "";
+    paint(false);
+    return;
+  }
+
+  const statusBtn = event.target.closest("[data-status]");
+  if (statusBtn && cache?.raffle) {
+    const r = route();
+    busy = true;
+    try {
+      await api.setStatus(r.id, r.token, statusBtn.dataset.status);
+      cache = await load(r);
+      paint(false);
+    } catch (error) {
+      errorMsg = error.message;
+      paint(false);
+    } finally {
+      busy = false;
+    }
+    return;
+  }
+
+  if (event.target.closest("[data-draw]")) {
+    const ok = confirm("Se elige un número al azar entre los pagados y la rifa queda cerrada. ¿Sortear ahora?");
+    if (!ok) return;
+    const r = route();
+    try {
+      await api.draw(r.id, r.token);
+      cache = await load(r);
+      errorMsg = "";
+      paint(true);
+    } catch (error) {
+      errorMsg = error.message;
+      paint(false);
+    }
+    return;
+  }
+
+  if (event.target.closest("[data-csv]") && cache?.raffle) {
+    downloadCsv(cache.raffle, cache.orders || []);
+  }
+});
+
+document.body.addEventListener("input", (event) => {
+  const form = event.target.closest("#form-pago");
+  if (!form) return;
+  buyer = {
+    name: form.name.value,
+    email: form.email.value,
+    phone: form.phone.value,
+  };
+});
+
+document.body.addEventListener("submit", async (event) => {
+  const form = event.target;
+  if (form.id === "form-rifa") {
+    event.preventDefault();
+    if (form.company.value) return;
+    draft = {
+      title: form.title.value,
+      prize: form.prize.value,
+      description: form.description.value,
+      price: form.price.value,
+      total: form.total.value,
+      organizer: form.organizer.value,
+      phone: form.phone.value,
+    };
+    const input = {
+      title: draft.title.trim(),
+      prize: draft.prize.trim(),
+      description: draft.description.trim(),
+      price_clp: Number(draft.price),
+      total_numbers: Number(draft.total),
+      organizer_name: draft.organizer.trim(),
+      organizer_phone: chilePhone(draft.phone),
+    };
+    if (input.organizer_phone.length < 8) {
+      errorMsg = "Escribe un WhatsApp con código de país, por ejemplo +56 9 1234 5678.";
+      paint(false);
+      return;
+    }
+    busy = true;
+    errorMsg = "";
+    const button = form.querySelector("button");
+    button.disabled = true;
+    button.textContent = "Creando…";
+    try {
+      const created = await api.createRaffle(input);
+      remember({
+        id: created.id,
+        token: created.admin_token,
+        title: input.title,
+        prize: input.prize,
+      });
+      history.pushState({}, "", `${location.pathname}?admin=${encodeURIComponent(created.id)}&clave=${encodeURIComponent(created.admin_token)}`);
+      busy = false;
+      render(true);
+    } catch (error) {
+      busy = false;
+      errorMsg = error.message;
+      paint(false);
+    }
+    return;
+  }
+
+  if (form.id === "form-pago") {
+    event.preventDefault();
+    const draft = readBuyer(form);
+    if (chilePhone(draft.phone).length < 8) {
+      errorMsg = "Escribe tu WhatsApp para coordinar el premio.";
+      paint(false);
+      return;
+    }
+    const r = route();
+    busy = true;
+    errorMsg = "";
+    paint(false);
+    try {
+      const result = await api.checkout({
+        raffleId: r.id,
+        numbers: [...selected].sort((a, b) => a - b),
+        buyerName: draft.name.trim(),
+        buyerEmail: draft.email.trim(),
+        buyerPhone: chilePhone(draft.phone),
+      });
+      if (result.initPoint) {
+        location.href = result.initPoint;
+        return;
+      }
+      selected = new Set();
+      buyer = { name: "", email: "", phone: "" };
+      busy = false;
+      cache = await load({ ...r, orden: result.orderId, pago: "ok" });
+      history.replaceState({}, "", `${location.pathname}?rifa=${encodeURIComponent(r.id)}&orden=${encodeURIComponent(result.orderId)}&pago=ok`);
+      paint(true);
+      aviso("Pago simulado. En el sitio real aquí se abre Mercado Pago.");
+    } catch (error) {
+      busy = false;
+      errorMsg = error.message;
+      cache = await load(r);
+      paint(false);
+    }
+  }
+});
+
+window.addEventListener("popstate", () => {
+  selected = new Set();
+  errorMsg = "";
+  render(true);
+});
+
+const modo = document.querySelector("#modo");
+if (!live) {
+  modo.hidden = false;
+  modo.textContent = "Modo demostración: puedes recorrer la rifa, pero los pagos no son reales hasta conectar Supabase y Mercado Pago.";
+} else if (cfg.collectorName) {
+  modo.hidden = false;
+  modo.textContent = `Los pagos entran a la cuenta de Mercado Pago de ${cfg.collectorName}.`;
+}
+
+render(true);
